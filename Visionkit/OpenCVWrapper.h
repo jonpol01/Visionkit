@@ -19,6 +19,7 @@ NS_ASSUME_NONNULL_BEGIN
 @interface OpenCVWrapper : NSObject
 
 //+ (UIImage *)unwrapCircu@interface OpenCVWrapper : NSObject
++ (CVPixelBufferRef _Nullable)unwrapCircularText:(CVPixelBufferRef)pixelBuffer CF_RETURNS_NOT_RETAINED;
 
 + (CVPixelBufferRef _Nullable)preprocessPixelBuffer:(CVPixelBufferRef)pixelBuffer CF_RETURNS_NOT_RETAINED;
 

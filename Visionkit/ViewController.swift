@@ -21,11 +21,28 @@ class ViewController: UIViewController {
     }
 
     private func setupCamera() {
+        print("Setting up camera...")
         captureSession.sessionPreset = .high
 
-        guard let camera = AVCaptureDevice.default(for: .video),
-              let input = try? AVCaptureDeviceInput(device: camera) else {
-            print("Camera not available")
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.external, .builtInWideAngleCamera],
+            mediaType: .video,
+            position: .unspecified
+        )
+
+        for device in discovery.devices {
+            print("Found camera:", device.localizedName)
+        }
+
+        guard let camera = discovery.devices.first else {
+            print("No camera found")
+            return
+        }
+
+        print("Using camera:", camera.localizedName)
+
+        guard let input = try? AVCaptureDeviceInput(device: camera) else {
+            print("Cannot create input")
             return
         }
 
@@ -42,10 +59,31 @@ class ViewController: UIViewController {
 
         captureSession.startRunning()
     }
+//    private func setupCamera() {
+//        captureSession.sessionPreset = .high
+//
+//        guard let camera = AVCaptureDevice.default(for: .video),
+//              let input = try? AVCaptureDeviceInput(device: camera) else {
+//            print("Camera not available")
+//            return
+//        }
+//
+//        captureSession.addInput(input)
+//
+//        let output = AVCaptureVideoDataOutput()
+//        output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "videoQueue"))
+//        captureSession.addOutput(output)
+//
+//        previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
+//        previewLayer.videoGravity = .resizeAspectFill
+//        previewLayer.frame = view.bounds
+//        view.layer.addSublayer(previewLayer)
+//
+//        captureSession.startRunning()
+//    }
 }
 
 extension ViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
-
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
