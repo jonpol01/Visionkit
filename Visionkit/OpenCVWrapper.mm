@@ -349,15 +349,34 @@ static NSArray<NSNumber *> *_lastCircle = nil;
     );
 
     //-----------------------------------
-    // Convert to grayscale + enhance for OCR
+    // Convert to grayscale + clean + enhance
     //-----------------------------------
 
     cv::Mat grayBand;
     cv::cvtColor(unwrapped, grayBand, cv::COLOR_BGRA2GRAY);
 
+    // Bilateral filter: smooth noise/dirt while preserving text edges
+    cv::Mat filtered;
+    cv::bilateralFilter(grayBand, filtered, 9, 75, 75);
+
+    // Morphological opening: remove small bright/dark spots (dirt)
+    cv::Mat kernel = cv::getStructuringElement(
+        cv::MORPH_ELLIPSE, cv::Size(3, 3)
+    );
+    cv::morphologyEx(filtered, filtered, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(filtered, filtered, cv::MORPH_CLOSE, kernel);
+
     // CLAHE for better contrast
     cv::Ptr<cv::CLAHE> clahe2 = cv::createCLAHE(4.0);
-    clahe2->apply(grayBand, grayBand);
+    clahe2->apply(filtered, filtered);
+
+    // Sharpen to make text edges crisper
+    cv::Mat sharpKernel = (cv::Mat_<float>(3,3) <<
+         0, -1,  0,
+        -1,  5, -1,
+         0, -1,  0);
+    cv::Mat sharpened;
+    cv::filter2D(filtered, sharpened, -1, sharpKernel);
 
     //-----------------------------------
     // Output CVPixelBuffer
@@ -372,8 +391,8 @@ static NSArray<NSNumber *> *_lastCircle = nil;
 
     CVPixelBufferCreate(
         kCFAllocatorDefault,
-        grayBand.cols,
-        grayBand.rows,
+        sharpened.cols,
+        sharpened.rows,
         kCVPixelFormatType_32BGRA,
         (__bridge CFDictionaryRef)attrs,
         &outputBuffer
@@ -385,17 +404,75 @@ static NSArray<NSNumber *> *_lastCircle = nil;
     CVPixelBufferGetBaseAddress(outputBuffer);
 
     cv::Mat outMat(
-        grayBand.rows,
-        grayBand.cols,
+        sharpened.rows,
+        sharpened.cols,
         CV_8UC4,
         dest
     );
 
-    cv::cvtColor(grayBand, outMat, cv::COLOR_GRAY2BGRA);
+    cv::cvtColor(sharpened, outMat, cv::COLOR_GRAY2BGRA);
 
     CVPixelBufferUnlockBaseAddress(outputBuffer,0);
     CVPixelBufferUnlockBaseAddress(pixelBuffer,0);
 
+    return outputBuffer;
+}
+
++ (CVPixelBufferRef)cleanForOCR:(CVPixelBufferRef)pixelBuffer {
+    CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+
+    int width  = (int)CVPixelBufferGetWidth(pixelBuffer);
+    int height = (int)CVPixelBufferGetHeight(pixelBuffer);
+    unsigned char *base = (unsigned char *)CVPixelBufferGetBaseAddress(pixelBuffer);
+    size_t bpr = CVPixelBufferGetBytesPerRow(pixelBuffer);
+
+    cv::Mat bgra(height, width, CV_8UC4, base, bpr);
+
+    cv::Mat gray;
+    cv::cvtColor(bgra, gray, cv::COLOR_BGRA2GRAY);
+
+    // Bilateral filter: smooth dirt while preserving text edges
+    cv::Mat filtered;
+    cv::bilateralFilter(gray, filtered, 9, 75, 75);
+
+    // Morphological open+close: remove small dirt spots
+    cv::Mat morphKernel = cv::getStructuringElement(
+        cv::MORPH_ELLIPSE, cv::Size(3, 3)
+    );
+    cv::morphologyEx(filtered, filtered, cv::MORPH_OPEN, morphKernel);
+    cv::morphologyEx(filtered, filtered, cv::MORPH_CLOSE, morphKernel);
+
+    // CLAHE for contrast
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(4.0);
+    clahe->apply(filtered, filtered);
+
+    // Sharpen
+    cv::Mat sharpK = (cv::Mat_<float>(3,3) <<
+         0, -1,  0,
+        -1,  5, -1,
+         0, -1,  0);
+    cv::Mat sharpened;
+    cv::filter2D(filtered, sharpened, -1, sharpK);
+
+    // Output to new pixel buffer
+    CVPixelBufferRef outputBuffer = NULL;
+    NSDictionary *attrs = @{
+        (NSString*)kCVPixelBufferCGImageCompatibilityKey:@YES,
+        (NSString*)kCVPixelBufferCGBitmapContextCompatibilityKey:@YES
+    };
+    CVPixelBufferCreate(kCFAllocatorDefault,
+                        sharpened.cols, sharpened.rows,
+                        kCVPixelFormatType_32BGRA,
+                        (__bridge CFDictionaryRef)attrs,
+                        &outputBuffer);
+
+    CVPixelBufferLockBaseAddress(outputBuffer, 0);
+    void *dest = CVPixelBufferGetBaseAddress(outputBuffer);
+    cv::Mat outMat(sharpened.rows, sharpened.cols, CV_8UC4, dest);
+    cv::cvtColor(sharpened, outMat, cv::COLOR_GRAY2BGRA);
+    CVPixelBufferUnlockBaseAddress(outputBuffer, 0);
+
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
     return outputBuffer;
 }
 

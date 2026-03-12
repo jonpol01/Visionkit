@@ -23,9 +23,11 @@ class CameraViewController: UIViewController {
     /// Circle debug overlay
     private let circleOverlay = CAShapeLayer()
 
-    /// Accumulated unique text fragments from unwrapped OCR
-    private var collectedTexts = Set<String>()
-    private var lastCollectionReset = Date()
+    /// Multi-frame voting: track how many times each text fragment is seen
+    private var textVotes: [String: Int] = [:]
+    private var lastVoteReset = Date()
+    private let voteWindow: TimeInterval = 10  // seconds
+    private let minVotesToShow = 3  // must be seen at least N times
 
     // Buttons
     private let topTextButton = CameraViewController.makeToggleButton(title: "Top: ON", color: .systemGreen)
@@ -59,8 +61,8 @@ class CameraViewController: UIViewController {
         return label
     }()
 
-    // Unwrapped OCR label (top)
-    private let unwrappedLabel: UILabel = {
+    // Consensus label (top) — voted results from raw OCR
+    private let consensusLabel: UILabel = {
         let label = UILabel()
         label.translatesAutoresizingMaskIntoConstraints = false
         label.numberOfLines = 0
@@ -70,7 +72,7 @@ class CameraViewController: UIViewController {
         label.backgroundColor = UIColor.black.withAlphaComponent(0.6)
         label.layer.cornerRadius = 8
         label.layer.masksToBounds = true
-        label.text = "Unwrapped: –"
+        label.text = "Consensus: –"
         return label
     }()
 
@@ -132,7 +134,7 @@ class CameraViewController: UIViewController {
         
         // Add overlay labels + buttons
         view.addSubview(overlayLabel)
-        view.addSubview(unwrappedLabel)
+        view.addSubview(consensusLabel)
 
         let buttonStack = UIStackView(arrangedSubviews: [topTextButton, bottomTextButton, debugButton])
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
@@ -150,13 +152,13 @@ class CameraViewController: UIViewController {
             overlayLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             overlayLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
             overlayLabel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
-            // Unwrapped OCR label at top
-            unwrappedLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            unwrappedLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
-            unwrappedLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            // Button stack (top-right, below unwrapped label)
+            // Consensus label at top
+            consensusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            consensusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            consensusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            // Button stack (top-right, below consensus label)
             buttonStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
-            buttonStack.topAnchor.constraint(equalTo: unwrappedLabel.bottomAnchor, constant: 8),
+            buttonStack.topAnchor.constraint(equalTo: consensusLabel.bottomAnchor, constant: 8),
         ])
 
         captureSession.startRunning()
@@ -164,12 +166,12 @@ class CameraViewController: UIViewController {
 
     @objc private func toggleTopText() {
         showTopText.toggle()
-        unwrappedLabel.isHidden = !showTopText
+        consensusLabel.isHidden = !showTopText
         topTextButton.setTitle(showTopText ? "Top: ON" : "Top: OFF", for: .normal)
         topTextButton.backgroundColor = (showTopText ? UIColor.systemGreen : UIColor.systemRed).withAlphaComponent(0.8)
         if !showTopText {
-            collectedTexts.removeAll()
-            unwrappedLabel.text = ""
+            textVotes.removeAll()
+            consensusLabel.text = "Consensus: –"
         }
     }
 
@@ -192,13 +194,21 @@ class CameraViewController: UIViewController {
 
 extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
 
+    // MARK: - GS1 filter
+
+    /// Returns true if text looks like a GS1 code we care about: (01)... or (10)...
+    private func isRelevantGS1(_ text: String) -> Bool {
+        let patterns = ["(01)", "(10)", "(01", "(10", "01)", "10)"]
+        return patterns.contains(where: { text.contains($0) })
+    }
+
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
 
-        // Throttle to ~3 FPS
+        // Throttle to ~2 FPS (bilateral filter on 4K is heavy)
         let now = Date()
-        guard now.timeIntervalSince(lastProcessTime) > 0.3 else { return }
+        guard now.timeIntervalSince(lastProcessTime) > 0.5 else { return }
         lastProcessTime = now
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
@@ -206,23 +216,21 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
         let bufferWidth = CVPixelBufferGetWidth(pixelBuffer)
         let bufferHeight = CVPixelBufferGetHeight(pixelBuffer)
 
-        // Vision OCR on raw frame → bottom label
-        if showBottomText {
-            recognizeText(from: pixelBuffer, orientation: .right, label: overlayLabel, prefix: "", looseFilter: false)
-        }
+        // Use autoreleasepool to free OpenCV-created pixel buffers each frame
+        autoreleasepool {
+            // Clean frame for better OCR, then run Vision OCR → both labels
+            let ocrBuffer: CVPixelBuffer
+            if let cleaned = OpenCVWrapper.clean(forOCR: pixelBuffer) {
+                ocrBuffer = cleaned
+            } else {
+                ocrBuffer = pixelBuffer
+            }
+            recognizeText(from: ocrBuffer, orientation: .right, showLive: showBottomText, showConsensus: showTopText)
 
-        // OpenCV unwrap → Vision OCR → top label
-        // Run OpenCV if either top text or debug overlay needs it
-        if showTopText || showDebugOverlay {
+            // Try circular unwrap — if circle found, also run OCR on unwrapped strip
             if let unwrapped = OpenCVWrapper.unwrapCircularText(pixelBuffer) {
                 if showTopText {
-                    recognizeText(from: unwrapped, orientation: .up, label: unwrappedLabel, prefix: "", looseFilter: true, collectInto: true)
-                }
-            } else {
-                if showTopText {
-                    DispatchQueue.main.async { [weak self] in
-                        self?.unwrappedLabel.text = "No circle detected"
-                    }
+                    recognizeUnwrapped(from: unwrapped)
                 }
             }
         }
@@ -240,65 +248,129 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
     private func recognizeText(
         from pixelBuffer: CVPixelBuffer,
         orientation: CGImagePropertyOrientation,
-        label: UILabel,
-        prefix: String,
-        looseFilter: Bool,
-        collectInto: Bool = false
+        showLive: Bool,
+        showConsensus: Bool
     ) {
-        let minConfidence: Float = looseFilter ? 0.3 : 0.8
-        let minLength = looseFilter ? 1 : 4
-
         let request = VNRecognizeTextRequest { [weak self] request, error in
+            guard let self = self else { return }
             guard let observations = request.results as? [VNRecognizedTextObservation] else { return }
 
-            var uniqueStrings = Set<String>()
+            // Collect all top-3 candidates for voting
+            var liveStrings = Set<String>()      // best candidate per region (for live label)
+            var allCandidates: [(String, Float)] = []  // all candidates with confidence (for voting)
 
             for observation in observations {
-                guard let candidate = observation.topCandidates(3).first else { continue }
+                let candidates = observation.topCandidates(3)
+                guard let best = candidates.first else { continue }
 
-                let text = candidate.string
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let bestText = best.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                if best.confidence > 0.5 && bestText.count > 1 {
+                    liveStrings.insert(bestText)
+                }
 
-                if candidate.confidence > minConfidence && text.count > minLength {
-                    uniqueStrings.insert(text)
+                // Add all candidates for voting (weighted by rank)
+                for (rank, candidate) in candidates.enumerated() {
+                    let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if candidate.confidence > 0.3 && text.count > 1 {
+                        // Weight: rank 0 = 3 votes, rank 1 = 2, rank 2 = 1
+                        let weight = Float(3 - rank)
+                        allCandidates.append((text, weight))
+                    }
                 }
             }
 
             DispatchQueue.main.async {
-                guard let self = self else { return }
-
-                if collectInto {
-                    // Reset collection every 10 seconds
-                    if Date().timeIntervalSince(self.lastCollectionReset) > 10 {
-                        self.collectedTexts.removeAll()
-                        self.lastCollectionReset = Date()
-                    }
-                    if !uniqueStrings.isEmpty {
-                        NSLog("[Unwrapped OCR] new: %@", uniqueStrings.joined(separator: " | "))
-                    }
-                    self.collectedTexts.formUnion(uniqueStrings)
-                    let sorted = self.collectedTexts.sorted()
-                    NSLog("[Unwrapped OCR] collected: %@", sorted.joined(separator: " | "))
-                    label.text = sorted.isEmpty ? "\(prefix)–" : "\(prefix)\(sorted.joined(separator: " | "))"
-                } else {
-                    if uniqueStrings.isEmpty {
-                        label.text = prefix.isEmpty ? "" : "\(prefix)–"
+                // Bottom: live OCR (best candidate per region)
+                if showLive {
+                    if liveStrings.isEmpty {
+                        self.overlayLabel.text = ""
                     } else {
-                        let combined = uniqueStrings.joined(separator: " \n")
-                        label.text = "\(prefix)\(combined)"
+                        self.overlayLabel.text = liveStrings.joined(separator: " \n")
                     }
+                }
+
+                // Top: weighted voted consensus from all candidates
+                if showConsensus {
+                    // Reset votes periodically
+                    if Date().timeIntervalSince(self.lastVoteReset) > self.voteWindow {
+                        self.textVotes.removeAll()
+                        self.lastVoteReset = Date()
+                    }
+
+                    // Add weighted votes — only for GS1-relevant text
+                    for (text, weight) in allCandidates {
+                        if self.isRelevantGS1(text) {
+                            self.textVotes[text, default: 0] += Int(weight)
+                        }
+                    }
+
+                    let confirmed = self.textVotes
+                        .filter { $0.value >= self.minVotesToShow }
+                        .sorted { $0.value > $1.value }
+                        .map { "\($0.key)(\($0.value))" }
+
+                    NSLog("[OCR votes] %@", self.textVotes.map { "\($0.key):\($0.value)" }.joined(separator: " | "))
+
+                    self.consensusLabel.text = confirmed.isEmpty
+                        ? "Consensus: –"
+                        : confirmed.joined(separator: " | ")
                 }
             }
         }
 
         request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = looseFilter
+        request.usesLanguageCorrection = true
         request.recognitionLanguages = ["en_US"]
-        request.minimumTextHeight = looseFilter ? 0.002 : 0.005
+        request.minimumTextHeight = 0.003
 
         let handler = VNImageRequestHandler(
             cvPixelBuffer: pixelBuffer,
             orientation: orientation,
+            options: [:]
+        )
+        try? handler.perform([request])
+    }
+
+    // MARK: - Unwrapped OCR (circular objects)
+
+    /// Run OCR on the unwrapped circular strip and add votes to consensus.
+    private func recognizeUnwrapped(from pixelBuffer: CVPixelBuffer) {
+        let request = VNRecognizeTextRequest { [weak self] request, error in
+            guard let self = self else { return }
+            guard let observations = request.results as? [VNRecognizedTextObservation] else { return }
+
+            var unwrappedCandidates: [(String, Int)] = []
+
+            for observation in observations {
+                for (rank, candidate) in observation.topCandidates(3).enumerated() {
+                    let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if candidate.confidence > 0.3 && text.count > 1 {
+                        unwrappedCandidates.append((text, 3 - rank))
+                    }
+                }
+            }
+
+            if !unwrappedCandidates.isEmpty {
+                DispatchQueue.main.async {
+                    // Add unwrapped votes — only GS1-relevant
+                    for (text, weight) in unwrappedCandidates {
+                        if self.isRelevantGS1(text) {
+                            self.textVotes[text, default: 0] += weight
+                        }
+                    }
+                    NSLog("[Unwrap OCR] added %d candidates to votes", unwrappedCandidates.count)
+                }
+            }
+        }
+
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        request.recognitionLanguages = ["en_US"]
+        request.minimumTextHeight = 0.002
+
+        let handler = VNImageRequestHandler(
+            cvPixelBuffer: pixelBuffer,
+            orientation: .up,
             options: [:]
         )
         try? handler.perform([request])
