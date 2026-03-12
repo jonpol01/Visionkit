@@ -34,7 +34,13 @@
 
 using namespace cv;
 
+static NSArray<NSNumber *> *_lastCircle = nil;
+
 @implementation OpenCVWrapper
+
++ (NSArray<NSNumber *> *)lastDetectedCircle {
+    return _lastCircle;
+}
 
 //+ (UIImage *)unwrapCircularText:(UIImage *)image {
 //
@@ -248,51 +254,59 @@ using namespace cv;
     cv::GaussianBlur(norm, norm, cv::Size(5,5), 1.5);
 
     //-----------------------------------
-    // Edge detection
-    //-----------------------------------
-
-    cv::Mat edges;
-    cv::Canny(norm, edges, 60, 140);
-
-    //-----------------------------------
     // Circle detection
     //-----------------------------------
 
     std::vector<cv::Vec3f> circles;
 
+    // HOUGH_GRADIENT runs Canny internally — feed it grayscale, not edges.
+    // param1 = Canny high threshold (internal), param2 = accumulator threshold
     cv::HoughCircles(
-        edges,
+        norm,
         circles,
         cv::HOUGH_GRADIENT,
-        1.2,
-        norm.rows/4,
-        120,
-        40,
-        norm.rows/6,
-        norm.rows/2
+        1.5,            // accumulator resolution
+        norm.rows / 3,  // min distance between centers
+        150,            // Canny high threshold
+        80,             // accumulator threshold (higher = fewer false positives)
+        norm.rows / 6,  // min radius
+        norm.rows / 2   // max radius
     );
+
+    NSLog(@"[OpenCV] circles detected: %lu", circles.size());
 
     if(circles.empty())
     {
+        _lastCircle = nil;
         CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-        return pixelBuffer;
+        return nil;
     }
 
-    cv::Vec3f c = circles[0];
+    // Pick the largest circle (most likely the actual object)
+    cv::Vec3f best = circles[0];
+    for(size_t i = 1; i < circles.size(); i++) {
+        if(circles[i][2] > best[2]) best = circles[i];
+    }
 
-    float cx = c[0];
-    float cy = c[1];
-    float r  = c[2];
+    float cx = best[0];
+    float cy = best[1];
+    float r  = best[2];
+
+    // Store for debug overlay
+    _lastCircle = @[@(cx), @(cy), @(r)];
+
+    NSLog(@"[OpenCV] best circle: center=(%.0f, %.0f) radius=%.0f  frame=%dx%d", cx, cy, r, width, height);
 
     //-----------------------------------
-    // Define ring region
+    // Define ring region (wide band to
+    // capture text at various positions)
     //-----------------------------------
 
-    float rInner = r * 0.75;
-    float rOuter = r * 1.05;
+    float rInner = r * 0.50;
+    float rOuter = r * 1.15;
 
-    int unwrapHeight = 120;
-    int unwrapWidth  = 1000;
+    int unwrapHeight = 200;
+    int unwrapWidth  = 1200;
 
     //-----------------------------------
     // Build remap grids
@@ -335,46 +349,15 @@ using namespace cv;
     );
 
     //-----------------------------------
-    // Convert to grayscale
+    // Convert to grayscale + enhance for OCR
     //-----------------------------------
 
     cv::Mat grayBand;
     cv::cvtColor(unwrapped, grayBand, cv::COLOR_BGRA2GRAY);
 
-    //-----------------------------------
-    // Enhance engraved characters
-    //-----------------------------------
-
-    cv::Mat blackhat;
-
-    cv::Mat kernel =
-    cv::getStructuringElement(
-        cv::MORPH_RECT,
-        cv::Size(21,7)
-    );
-
-    cv::morphologyEx(
-        grayBand,
-        blackhat,
-        cv::MORPH_BLACKHAT,
-        kernel
-    );
-
-    //-----------------------------------
-    // Threshold
-    //-----------------------------------
-
-    cv::Mat thresh;
-
-    cv::adaptiveThreshold(
-        blackhat,
-        thresh,
-        255,
-        cv::ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv::THRESH_BINARY,
-        15,
-        -2
-    );
+    // CLAHE for better contrast
+    cv::Ptr<cv::CLAHE> clahe2 = cv::createCLAHE(4.0);
+    clahe2->apply(grayBand, grayBand);
 
     //-----------------------------------
     // Output CVPixelBuffer
@@ -389,8 +372,8 @@ using namespace cv;
 
     CVPixelBufferCreate(
         kCFAllocatorDefault,
-        thresh.cols,
-        thresh.rows,
+        grayBand.cols,
+        grayBand.rows,
         kCVPixelFormatType_32BGRA,
         (__bridge CFDictionaryRef)attrs,
         &outputBuffer
@@ -402,13 +385,13 @@ using namespace cv;
     CVPixelBufferGetBaseAddress(outputBuffer);
 
     cv::Mat outMat(
-        thresh.rows,
-        thresh.cols,
+        grayBand.rows,
+        grayBand.cols,
         CV_8UC4,
         dest
     );
 
-    cv::cvtColor(thresh, outMat, cv::COLOR_GRAY2BGRA);
+    cv::cvtColor(grayBand, outMat, cv::COLOR_GRAY2BGRA);
 
     CVPixelBufferUnlockBaseAddress(outputBuffer,0);
     CVPixelBufferUnlockBaseAddress(pixelBuffer,0);

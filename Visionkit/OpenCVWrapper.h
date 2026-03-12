@@ -21,6 +21,9 @@ NS_ASSUME_NONNULL_BEGIN
 //+ (UIImage *)unwrapCircu@interface OpenCVWrapper : NSObject
 + (CVPixelBufferRef _Nullable)unwrapCircularText:(CVPixelBufferRef)pixelBuffer CF_RETURNS_NOT_RETAINED;
 
+/// Returns the last detected circle as [cx, cy, radius] in pixel coords, or nil if none.
++ (NSArray<NSNumber *> * _Nullable)lastDetectedCircle;
+
 + (CVPixelBufferRef _Nullable)preprocessPixelBuffer:(CVPixelBufferRef)pixelBuffer CF_RETURNS_NOT_RETAINED;
 
 
