@@ -14,7 +14,13 @@ class CameraViewController: UIViewController {
     private let captureSession = AVCaptureSession()
     private var previewLayer: AVCaptureVideoPreviewLayer!
     private var lastProcessTime = Date()
+
+    /// FastVLM inference service
+    private let vlmService = VLMService()
+    /// Toggle between Vision OCR and FastVLM
+    var useVLM = true
     
+    // OCR label (bottom)
     private let overlayLabel: UILabel = {
         let label = UILabel()
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -29,9 +35,30 @@ class CameraViewController: UIViewController {
         return label
     }()
 
+    // VLM label (top)
+    private let vlmLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.numberOfLines = 0
+        label.textAlignment = .center
+        label.textColor = .yellow
+        label.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .medium)
+        label.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        label.layer.cornerRadius = 8
+        label.layer.masksToBounds = true
+        label.text = "VLM: loading…"
+        return label
+    }()
+
     override func viewDidLoad() {
         super.viewDidLoad()
         setupCamera()
+
+        // Load FastVLM model in background
+        Task { @MainActor in
+            await vlmService.load()
+            vlmLabel.text = vlmService.isLoaded ? "VLM: ready" : "VLM: \(vlmService.statusMessage)"
+        }
     }
 
     private func setupCamera() {
@@ -68,23 +95,29 @@ class CameraViewController: UIViewController {
 
         view.layer.addSublayer(previewLayer)
 
-        // Orientation might be needed for correct text recognition
+        // Orientation for external HDMI camera
+        // External capture cards typically deliver landscape frames.
+        // Adjust the angle here if the preview is rotated:
+        //   0 = no rotation, 90 = portrait, 180 = upside-down, 270 = landscape-left
         if let connection = previewLayer.connection {
-//            if connection.isVideoOrientationSupported {
-//                connection.videoOrientation = .landscapeRight
-//            }
-            let angle: CGFloat = 90
+            let angle: CGFloat = 0
             if connection.isVideoRotationAngleSupported(angle) {
                 connection.videoRotationAngle = angle
             }
         }
         
-        // Add overlay label on top of preview
+        // Add overlay labels
         view.addSubview(overlayLabel)
+        view.addSubview(vlmLabel)
         NSLayoutConstraint.activate([
+            // OCR label at bottom
             overlayLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             overlayLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
-            overlayLabel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12)
+            overlayLabel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
+            // VLM label at top
+            vlmLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            vlmLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            vlmLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
         ])
 
         captureSession.startRunning()
@@ -104,16 +137,27 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
+        // Always run Vision OCR on raw frame
         recognizeText(from: pixelBuffer)
-//        if let processedBuffer = OpenCVWrapper.preprocessPixelBuffer(pixelBuffer) {
-//            recognizeText(from: processedBuffer)
-//        } else {
-//            recognizeText(from: pixelBuffer)
-//        }
-        if let processed = OpenCVWrapper.unwrapCircularText(pixelBuffer) {
-            recognizeText(from: processed)
-        } else {
-            recognizeText(from: pixelBuffer)
+
+        // Run OpenCV unwrap → FastVLM
+        if useVLM {
+            let bufferForVLM: CVPixelBuffer
+            if let processed = OpenCVWrapper.unwrapCircularText(pixelBuffer) {
+                bufferForVLM = processed
+            } else {
+                bufferForVLM = pixelBuffer
+            }
+            recognizeWithVLM(from: bufferForVLM)
+        }
+    }
+
+    private func recognizeWithVLM(from pixelBuffer: CVPixelBuffer) {
+        guard vlmService.isLoaded, !vlmService.running else { return }
+
+        Task { @MainActor in
+            let result = await vlmService.recognize(pixelBuffer: pixelBuffer)
+            vlmLabel.text = "VLM: \(result)"
         }
     }
 

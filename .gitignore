@@ -1,1 +1,4 @@
 /opencv2.framework/
+
+# FastVLM model weights (symlink to apex-vlm, too large for git)
+Visionkit/model
