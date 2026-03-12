@@ -87,7 +87,7 @@ class VLMService {
     /// `prompt` controls what you ask the model, e.g. "Read the text in this image."
     public func recognize(
         pixelBuffer: CVPixelBuffer,
-        prompt: String = "Read all the text in this image. Output only the text, nothing else."
+        prompt: String = "OCR this image. Return only the exact text visible, nothing else."
     ) async -> String {
         guard !running else { return output }
 
