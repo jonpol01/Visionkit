@@ -122,9 +122,9 @@ class CameraViewController: UIViewController {
         // Load the selected AI backend
         Task { @MainActor in
             if aiBackend == .qwen {
-                vlmLabel.text = "  AI: Downloading Qwen…  "
+                vlmLabel.text = "  AI: Downloading \(LLMService.modelID)…  "
                 await llmService.load()
-                vlmLabel.text = "  AI: Qwen Ready  "
+                vlmLabel.text = "  AI: \(LLMService.modelID) Ready  "
             } else {
                 await vlmService.load()
                 vlmLabel.text = "  AI: FastVLM Ready  "
@@ -295,14 +295,14 @@ class CameraViewController: UIViewController {
 
     @objc private func switchBackend() {
         aiBackend = (aiBackend == .qwen) ? .fastVLM : .qwen
-        let name = aiBackend == .qwen ? "Qwen" : "FastVLM"
-        backendButton.setTitle("\(name)", for: .normal)
+        let name = aiBackend == .qwen ? LLMService.modelID : "FastVLM"
+        backendButton.setTitle(aiBackend == .qwen ? "Qwen" : "FastVLM", for: .normal)
         vlmLabel.text = "  AI: Loading \(name)…  "
 
         Task { @MainActor in
             if aiBackend == .qwen {
                 await llmService.load()
-                vlmLabel.text = "  AI: Qwen Ready  "
+                vlmLabel.text = "  AI: \(LLMService.modelID) Ready  "
             } else {
                 await vlmService.load()
                 vlmLabel.text = "  AI: FastVLM Ready  "
