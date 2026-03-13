@@ -26,7 +26,10 @@ class VLMService {
     // MARK: - Config
 
     private let generateParameters = GenerateParameters(temperature: 0.0)
-    private let maxTokens = 120
+    private let maxTokens = 30
+
+    /// Quick gate for callers on the camera thread.
+    public var isReady: Bool { isLoaded && !running }
 
     // MARK: - Internal
 

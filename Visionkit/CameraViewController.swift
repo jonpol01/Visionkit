@@ -23,6 +23,10 @@ class CameraViewController: UIViewController {
     private var showTopText = true
     private var showBottomText = true
     private var showDebugOverlay = true
+    private var showVLM = true
+
+    /// FastVLM service
+    private let vlmService = VLMService()
 
     /// Guide overlays
     private let crosshairLayer = CAShapeLayer()
@@ -36,12 +40,29 @@ class CameraViewController: UIViewController {
     /// Multi-frame voting: track how many times each text fragment is seen
     private var textVotes: [String: Int] = [:]
     private var lastVoteReset = Date()
-    private let voteWindow: TimeInterval = 10  // seconds
+    private let voteWindow: TimeInterval = 15  // seconds
     private let minVotesToShow = 3  // must be seen at least N times
+    private let minVotesForVLM = 3  // must have 3+ votes before feeding to VLM
+
+    // VLM result label (center of screen — prominent "AI reading")
+    private let vlmLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.numberOfLines = 0
+        label.textAlignment = .center
+        label.textColor = .white
+        label.font = UIFont.monospacedSystemFont(ofSize: 22, weight: .bold)
+        label.backgroundColor = UIColor(red: 0.0, green: 0.55, blue: 0.9, alpha: 0.85)
+        label.layer.cornerRadius = 14
+        label.layer.masksToBounds = true
+        label.text = "  AI: Loading…  "
+        return label
+    }()
 
     // Buttons
-    private let topTextButton = CameraViewController.makeToggleButton(title: "VLM: ON", color: .systemGreen)
+    private let topTextButton = CameraViewController.makeToggleButton(title: "Vote: ON", color: .systemGreen)
     private let bottomTextButton = CameraViewController.makeToggleButton(title: "OCR: ON", color: .systemGreen)
+    private let vlmButton = CameraViewController.makeToggleButton(title: "AI: ON", color: .systemGreen)
     private let debugButton = CameraViewController.makeToggleButton(title: "Debug: ON", color: .systemGreen)
     private let cameraButton = CameraViewController.makeToggleButton(title: "Cam: –", color: .systemBlue)
 
@@ -90,6 +111,12 @@ class CameraViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         setupCamera()
+
+        // Load FastVLM model in background
+        Task { @MainActor in
+            await vlmService.load()
+            vlmLabel.text = "  AI: Ready  "
+        }
     }
 
     override func viewDidLayoutSubviews() {
@@ -205,8 +232,9 @@ class CameraViewController: UIViewController {
         // Add overlay labels + buttons
         view.addSubview(overlayLabel)
         view.addSubview(consensusLabel)
+        view.addSubview(vlmLabel)
 
-        let buttonStack = UIStackView(arrangedSubviews: [cameraButton, topTextButton, bottomTextButton, debugButton])
+        let buttonStack = UIStackView(arrangedSubviews: [cameraButton, vlmButton, topTextButton, bottomTextButton, debugButton])
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
         buttonStack.axis = .vertical
         buttonStack.alignment = .trailing
@@ -214,6 +242,7 @@ class CameraViewController: UIViewController {
         view.addSubview(buttonStack)
 
         cameraButton.addTarget(self, action: #selector(cycleCamera), for: .touchUpInside)
+        vlmButton.addTarget(self, action: #selector(toggleVLM), for: .touchUpInside)
         topTextButton.addTarget(self, action: #selector(toggleTopText), for: .touchUpInside)
         bottomTextButton.addTarget(self, action: #selector(toggleBottomText), for: .touchUpInside)
         debugButton.addTarget(self, action: #selector(toggleDebug), for: .touchUpInside)
@@ -227,6 +256,11 @@ class CameraViewController: UIViewController {
             consensusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             consensusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
             consensusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            // VLM label — centered on screen, padded
+            vlmLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            vlmLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            vlmLabel.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 24),
+            vlmLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
             // Button stack (top-right, below consensus label)
             buttonStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
             buttonStack.topAnchor.constraint(equalTo: consensusLabel.bottomAnchor, constant: 8),
@@ -235,10 +269,20 @@ class CameraViewController: UIViewController {
         captureSession.startRunning()
     }
 
+    @objc private func toggleVLM() {
+        showVLM.toggle()
+        vlmLabel.isHidden = !showVLM
+        vlmButton.setTitle(showVLM ? "AI: ON" : "AI: OFF", for: .normal)
+        vlmButton.backgroundColor = (showVLM ? UIColor.systemGreen : UIColor.systemRed).withAlphaComponent(0.8)
+        if !showVLM {
+            vlmLabel.text = "  AI: Off  "
+        }
+    }
+
     @objc private func toggleTopText() {
         showTopText.toggle()
         consensusLabel.isHidden = !showTopText
-        topTextButton.setTitle(showTopText ? "VLM: ON" : "VLM: OFF", for: .normal)
+        topTextButton.setTitle(showTopText ? "Vote: ON" : "Vote: OFF", for: .normal)
         topTextButton.backgroundColor = (showTopText ? UIColor.systemGreen : UIColor.systemRed).withAlphaComponent(0.8)
         if !showTopText {
             textVotes.removeAll()
@@ -289,6 +333,28 @@ class CameraViewController: UIViewController {
         print("Switched to camera:", newCamera.localizedName)
     }
 
+    /// Ask the VLM to correct OCR fragments using the image + OCR hints.
+    private func sendToVLM(pixelBuffer: CVPixelBuffer, ocrCandidates: [String]) {
+        let joined = ocrCandidates.joined(separator: ", ")
+        let prompt = """
+        OCR detected these text fragments on this engraved metal part: \(joined)
+        Correct any errors and output ONLY the final text. No explanations.
+        """
+
+        NSLog("[VLM input] %@", joined)
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await self.vlmService.recognize(
+                pixelBuffer: pixelBuffer,
+                prompt: prompt
+            )
+            let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+            NSLog("[VLM output] %@", trimmed)
+            self.vlmLabel.text = trimmed.isEmpty ? "  AI: (no text)  " : "  \(trimmed)  "
+        }
+    }
+
     private func shortName(_ device: AVCaptureDevice) -> String {
         let name = device.localizedName
         if name.count > 12 {
@@ -312,9 +378,9 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
 
-        // Throttle to ~2 FPS (bilateral filter on 4K is heavy)
+        // Throttle to ~3 FPS
         let now = Date()
-        guard now.timeIntervalSince(lastProcessTime) > 0.5 else { return }
+        guard now.timeIntervalSince(lastProcessTime) > 0.33 else { return }
         lastProcessTime = now
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
@@ -331,14 +397,14 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
             } else {
                 ocrBuffer = pixelBuffer
             }
-            recognizeText(from: ocrBuffer, orientation: .right, showLive: showBottomText, showConsensus: showTopText)
+            recognizeText(from: ocrBuffer, rawBuffer: pixelBuffer, orientation: .right, showLive: showBottomText, showConsensus: showTopText)
 
             // Try circular unwrap — if circle found, also run OCR on unwrapped strip
-            if let unwrapped = OpenCVWrapper.unwrapCircularText(pixelBuffer) {
-                if showTopText {
-                    recognizeUnwrapped(from: unwrapped)
-                }
+            let unwrapped = OpenCVWrapper.unwrapCircularText(pixelBuffer)
+            if let unwrapped, showTopText {
+                recognizeUnwrapped(from: unwrapped)
             }
+
         }
 
         // Run circle detection for visual overlay (separate from unwrap)
@@ -358,6 +424,7 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
 
     private func recognizeText(
         from pixelBuffer: CVPixelBuffer,
+        rawBuffer: CVPixelBuffer,
         orientation: CGImagePropertyOrientation,
         showLive: Bool,
         showConsensus: Bool
@@ -404,6 +471,7 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
                     }
                 }
 
+
                 // Top: weighted voted consensus from all candidates
                 if showConsensus {
                     // Reset votes periodically
@@ -429,6 +497,17 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
                     self.consensusLabel.text = confirmed.isEmpty
                         ? "Consensus: –"
                         : confirmed.joined(separator: " | ")
+
+                    // Feed high-confidence candidates (10+ votes) to VLM for correction
+                    if self.showVLM && self.vlmService.isReady {
+                        let highConfidence = self.textVotes
+                            .filter { $0.value >= self.minVotesForVLM }
+                            .sorted { $0.value > $1.value }
+                            .map { $0.key }
+                        if !highConfidence.isEmpty {
+                            self.sendToVLM(pixelBuffer: rawBuffer, ocrCandidates: highConfidence)
+                        }
+                    }
                 }
 
                 // Draw text highlight bounding boxes
