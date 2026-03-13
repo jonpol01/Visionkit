@@ -34,7 +34,13 @@
 
 using namespace cv;
 
+static NSArray<NSNumber *> *_lastCircle = nil;
+
 @implementation OpenCVWrapper
+
++ (NSArray<NSNumber *> *)lastDetectedCircle {
+    return _lastCircle;
+}
 
 //+ (UIImage *)unwrapCircularText:(UIImage *)image {
 //
@@ -217,6 +223,47 @@ using namespace cv;
 //    return outputBuffer;
 //}
 
++ (void)detectCircle:(CVPixelBufferRef)pixelBuffer {
+    CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+
+    int width  = (int)CVPixelBufferGetWidth(pixelBuffer);
+    int height = (int)CVPixelBufferGetHeight(pixelBuffer);
+    unsigned char *base = (unsigned char *)CVPixelBufferGetBaseAddress(pixelBuffer);
+
+    cv::Mat frame(height, width, CV_8UC4, base);
+    cv::Mat gray;
+    cv::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY);
+
+    cv::Mat norm;
+    cv::normalize(gray, norm, 0, 255, cv::NORM_MINMAX);
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(6.0);
+    clahe->apply(norm, norm);
+    cv::GaussianBlur(norm, norm, cv::Size(5,5), 1.5);
+
+    std::vector<cv::Vec3f> circles;
+    cv::HoughCircles(
+        norm, circles, cv::HOUGH_GRADIENT,
+        1.5, norm.rows / 3, 150, 80,
+        norm.rows / 6, norm.rows / 2
+    );
+
+    if (circles.empty()) {
+        _lastCircle = nil;
+    } else {
+        // Pick circle closest to frame center
+        float fcx = width / 2.0f, fcy = height / 2.0f;
+        cv::Vec3f best = circles[0];
+        float bestD = hypotf(best[0] - fcx, best[1] - fcy);
+        for (size_t i = 1; i < circles.size(); i++) {
+            float d = hypotf(circles[i][0] - fcx, circles[i][1] - fcy);
+            if (d < bestD) { best = circles[i]; bestD = d; }
+        }
+        _lastCircle = @[@(best[0]), @(best[1]), @(best[2])];
+    }
+
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+}
+
 + (CVPixelBufferRef)unwrapCircularText:(CVPixelBufferRef)pixelBuffer {
     CVPixelBufferLockBaseAddress(pixelBuffer, 0);
 
@@ -229,70 +276,24 @@ using namespace cv;
     cv::Mat frame(height, width, CV_8UC4, base);
 
     //-----------------------------------
-    // Convert to grayscale
+    // Fixed center — user aligns object
+    // to crosshair, no circle detection
     //-----------------------------------
 
-    cv::Mat gray;
-    cv::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY);
+    float cx = width  / 2.0f;
+    float cy = height / 2.0f;
+    float r  = MIN(width, height) * 0.40f;
 
     //-----------------------------------
-    // Normalize lighting
+    // Define ring region (wide band to
+    // capture text at various positions)
     //-----------------------------------
 
-    cv::Mat norm;
-    cv::normalize(gray, norm, 0, 255, cv::NORM_MINMAX);
+    float rInner = r * 0.45;
+    float rOuter = r * 1.10;
 
-    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(6.0);
-    clahe->apply(norm, norm);
-
-    cv::GaussianBlur(norm, norm, cv::Size(5,5), 1.5);
-
-    //-----------------------------------
-    // Edge detection
-    //-----------------------------------
-
-    cv::Mat edges;
-    cv::Canny(norm, edges, 60, 140);
-
-    //-----------------------------------
-    // Circle detection
-    //-----------------------------------
-
-    std::vector<cv::Vec3f> circles;
-
-    cv::HoughCircles(
-        edges,
-        circles,
-        cv::HOUGH_GRADIENT,
-        1.2,
-        norm.rows/4,
-        120,
-        40,
-        norm.rows/6,
-        norm.rows/2
-    );
-
-    if(circles.empty())
-    {
-        CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-        return pixelBuffer;
-    }
-
-    cv::Vec3f c = circles[0];
-
-    float cx = c[0];
-    float cy = c[1];
-    float r  = c[2];
-
-    //-----------------------------------
-    // Define ring region
-    //-----------------------------------
-
-    float rInner = r * 0.75;
-    float rOuter = r * 1.05;
-
-    int unwrapHeight = 120;
-    int unwrapWidth  = 1000;
+    int unwrapHeight = 400;
+    int unwrapWidth  = 2400;
 
     //-----------------------------------
     // Build remap grids
@@ -335,46 +336,45 @@ using namespace cv;
     );
 
     //-----------------------------------
-    // Convert to grayscale
+    // Flip horizontally (raw buffer is
+    // mirrored vs preview) so text reads
+    // correctly for Vision OCR
+    //-----------------------------------
+
+    cv::flip(unwrapped, unwrapped, 1);
+
+    //-----------------------------------
+    // Convert to grayscale + clean + enhance
     //-----------------------------------
 
     cv::Mat grayBand;
     cv::cvtColor(unwrapped, grayBand, cv::COLOR_BGRA2GRAY);
 
-    //-----------------------------------
-    // Enhance engraved characters
-    //-----------------------------------
+    // Mild blur to reduce noise without destroying text edges
+    cv::GaussianBlur(grayBand, grayBand, cv::Size(3, 3), 0.5);
 
-    cv::Mat blackhat;
+    // CLAHE — enhance local contrast (makes engravings stand out)
+    cv::Ptr<cv::CLAHE> clahe2 = cv::createCLAHE(3.0, cv::Size(8, 8));
+    clahe2->apply(grayBand, grayBand);
 
-    cv::Mat kernel =
-    cv::getStructuringElement(
-        cv::MORPH_RECT,
-        cv::Size(21,7)
-    );
-
-    cv::morphologyEx(
-        grayBand,
-        blackhat,
-        cv::MORPH_BLACKHAT,
-        kernel
-    );
-
-    //-----------------------------------
-    // Threshold
-    //-----------------------------------
-
-    cv::Mat thresh;
-
+    // Adaptive threshold — binarize based on local contrast
+    // Works well for engraved text (local dark marks on lighter metal)
+    cv::Mat binary;
     cv::adaptiveThreshold(
-        blackhat,
-        thresh,
-        255,
+        grayBand, binary, 255,
         cv::ADAPTIVE_THRESH_GAUSSIAN_C,
         cv::THRESH_BINARY,
-        15,
-        -2
+        31,   // block size
+        8     // C constant
     );
+
+    // Small morphological close to fill gaps in thin text strokes
+    cv::Mat kernel = cv::getStructuringElement(
+        cv::MORPH_RECT, cv::Size(2, 2)
+    );
+    cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
+
+    cv::Mat &sharpened = binary;
 
     //-----------------------------------
     // Output CVPixelBuffer
@@ -389,8 +389,8 @@ using namespace cv;
 
     CVPixelBufferCreate(
         kCFAllocatorDefault,
-        thresh.cols,
-        thresh.rows,
+        sharpened.cols,
+        sharpened.rows,
         kCVPixelFormatType_32BGRA,
         (__bridge CFDictionaryRef)attrs,
         &outputBuffer
@@ -402,17 +402,75 @@ using namespace cv;
     CVPixelBufferGetBaseAddress(outputBuffer);
 
     cv::Mat outMat(
-        thresh.rows,
-        thresh.cols,
+        sharpened.rows,
+        sharpened.cols,
         CV_8UC4,
         dest
     );
 
-    cv::cvtColor(thresh, outMat, cv::COLOR_GRAY2BGRA);
+    cv::cvtColor(sharpened, outMat, cv::COLOR_GRAY2BGRA);
 
     CVPixelBufferUnlockBaseAddress(outputBuffer,0);
     CVPixelBufferUnlockBaseAddress(pixelBuffer,0);
 
+    return outputBuffer;
+}
+
++ (CVPixelBufferRef)cleanForOCR:(CVPixelBufferRef)pixelBuffer {
+    CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+
+    int width  = (int)CVPixelBufferGetWidth(pixelBuffer);
+    int height = (int)CVPixelBufferGetHeight(pixelBuffer);
+    unsigned char *base = (unsigned char *)CVPixelBufferGetBaseAddress(pixelBuffer);
+    size_t bpr = CVPixelBufferGetBytesPerRow(pixelBuffer);
+
+    cv::Mat bgra(height, width, CV_8UC4, base, bpr);
+
+    cv::Mat gray;
+    cv::cvtColor(bgra, gray, cv::COLOR_BGRA2GRAY);
+
+    // Bilateral filter: smooth dirt while preserving text edges
+    cv::Mat filtered;
+    cv::bilateralFilter(gray, filtered, 9, 75, 75);
+
+    // Morphological open+close: remove small dirt spots
+    cv::Mat morphKernel = cv::getStructuringElement(
+        cv::MORPH_ELLIPSE, cv::Size(3, 3)
+    );
+    cv::morphologyEx(filtered, filtered, cv::MORPH_OPEN, morphKernel);
+    cv::morphologyEx(filtered, filtered, cv::MORPH_CLOSE, morphKernel);
+
+    // CLAHE for contrast
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(4.0);
+    clahe->apply(filtered, filtered);
+
+    // Sharpen
+    cv::Mat sharpK = (cv::Mat_<float>(3,3) <<
+         0, -1,  0,
+        -1,  5, -1,
+         0, -1,  0);
+    cv::Mat sharpened;
+    cv::filter2D(filtered, sharpened, -1, sharpK);
+
+    // Output to new pixel buffer
+    CVPixelBufferRef outputBuffer = NULL;
+    NSDictionary *attrs = @{
+        (NSString*)kCVPixelBufferCGImageCompatibilityKey:@YES,
+        (NSString*)kCVPixelBufferCGBitmapContextCompatibilityKey:@YES
+    };
+    CVPixelBufferCreate(kCFAllocatorDefault,
+                        sharpened.cols, sharpened.rows,
+                        kCVPixelFormatType_32BGRA,
+                        (__bridge CFDictionaryRef)attrs,
+                        &outputBuffer);
+
+    CVPixelBufferLockBaseAddress(outputBuffer, 0);
+    void *dest = CVPixelBufferGetBaseAddress(outputBuffer);
+    cv::Mat outMat(sharpened.rows, sharpened.cols, CV_8UC4, dest);
+    cv::cvtColor(sharpened, outMat, cv::COLOR_GRAY2BGRA);
+    CVPixelBufferUnlockBaseAddress(outputBuffer, 0);
+
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
     return outputBuffer;
 }
 
