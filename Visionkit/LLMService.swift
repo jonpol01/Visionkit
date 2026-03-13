@@ -32,8 +32,8 @@ class LLMService {
     private let maxTokens = 40
 
     /// HuggingFace model ID — change this to try different models.
-    /// Qwen3-0.6B is tiny (~400 MB) and fast on iPad.
-    static let modelID = "mlx-community/Qwen3-0.6B-4bit"
+    /// Qwen3-4B-4bit (~2.5 GB) — stronger correction, still fits iPad 12 GB.
+    static let modelID = "mlx-community/Qwen3-4B-4bit"
 
     // MARK: - Internal
 
