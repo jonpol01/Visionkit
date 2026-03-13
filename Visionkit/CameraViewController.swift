@@ -66,7 +66,7 @@ class CameraViewController: UIViewController {
     }()
 
     // Buttons
-    private let topTextButton = CameraViewController.makeToggleButton(title: "Vote: ON", color: .systemGreen)
+    private let topTextButton = CameraViewController.makeToggleButton(title: "SCAN: ON", color: .systemGreen)
     private let bottomTextButton = CameraViewController.makeToggleButton(title: "OCR: ON", color: .systemGreen)
     private let vlmButton = CameraViewController.makeToggleButton(title: "AI: ON", color: .systemGreen)
     private let backendButton = CameraViewController.makeToggleButton(title: "Qwen", color: .systemPurple)
@@ -270,11 +270,10 @@ class CameraViewController: UIViewController {
             consensusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             consensusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
             consensusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            // VLM label — centered on screen, padded
-            vlmLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            vlmLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            vlmLabel.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 24),
-            vlmLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            // VLM label — just above the bottom OCR label
+            vlmLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            vlmLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            vlmLabel.bottomAnchor.constraint(equalTo: overlayLabel.topAnchor, constant: -8),
             // Button stack (top-right, below consensus label)
             buttonStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
             buttonStack.topAnchor.constraint(equalTo: consensusLabel.bottomAnchor, constant: 8),
@@ -313,11 +312,11 @@ class CameraViewController: UIViewController {
     @objc private func toggleTopText() {
         showTopText.toggle()
         consensusLabel.isHidden = !showTopText
-        topTextButton.setTitle(showTopText ? "Vote: ON" : "Vote: OFF", for: .normal)
+        topTextButton.setTitle(showTopText ? "SCAN: ON" : "SCAN: OFF", for: .normal)
         topTextButton.backgroundColor = (showTopText ? UIColor.systemGreen : UIColor.systemRed).withAlphaComponent(0.8)
         if !showTopText {
             textVotes.removeAll()
-            consensusLabel.text = "Consensus: –"
+            consensusLabel.text = "Scan: –"
         }
     }
 
