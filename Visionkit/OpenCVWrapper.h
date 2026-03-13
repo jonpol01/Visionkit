@@ -24,6 +24,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// Returns the last detected circle as [cx, cy, radius] in pixel coords, or nil if none.
 + (NSArray<NSNumber *> * _Nullable)lastDetectedCircle;
 
+/// Run HoughCircles for visual overlay only (does not affect unwrap).
++ (void)detectCircle:(CVPixelBufferRef)pixelBuffer;
+
 + (CVPixelBufferRef _Nullable)preprocessPixelBuffer:(CVPixelBufferRef)pixelBuffer CF_RETURNS_NOT_RETAINED;
 
 /// Clean frame for better OCR: bilateral filter, morphological cleanup, CLAHE, sharpen.

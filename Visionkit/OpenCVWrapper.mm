@@ -223,6 +223,47 @@ static NSArray<NSNumber *> *_lastCircle = nil;
 //    return outputBuffer;
 //}
 
++ (void)detectCircle:(CVPixelBufferRef)pixelBuffer {
+    CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+
+    int width  = (int)CVPixelBufferGetWidth(pixelBuffer);
+    int height = (int)CVPixelBufferGetHeight(pixelBuffer);
+    unsigned char *base = (unsigned char *)CVPixelBufferGetBaseAddress(pixelBuffer);
+
+    cv::Mat frame(height, width, CV_8UC4, base);
+    cv::Mat gray;
+    cv::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY);
+
+    cv::Mat norm;
+    cv::normalize(gray, norm, 0, 255, cv::NORM_MINMAX);
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(6.0);
+    clahe->apply(norm, norm);
+    cv::GaussianBlur(norm, norm, cv::Size(5,5), 1.5);
+
+    std::vector<cv::Vec3f> circles;
+    cv::HoughCircles(
+        norm, circles, cv::HOUGH_GRADIENT,
+        1.5, norm.rows / 3, 150, 80,
+        norm.rows / 6, norm.rows / 2
+    );
+
+    if (circles.empty()) {
+        _lastCircle = nil;
+    } else {
+        // Pick circle closest to frame center
+        float fcx = width / 2.0f, fcy = height / 2.0f;
+        cv::Vec3f best = circles[0];
+        float bestD = hypotf(best[0] - fcx, best[1] - fcy);
+        for (size_t i = 1; i < circles.size(); i++) {
+            float d = hypotf(circles[i][0] - fcx, circles[i][1] - fcy);
+            if (d < bestD) { best = circles[i]; bestD = d; }
+        }
+        _lastCircle = @[@(best[0]), @(best[1]), @(best[2])];
+    }
+
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+}
+
 + (CVPixelBufferRef)unwrapCircularText:(CVPixelBufferRef)pixelBuffer {
     CVPixelBufferLockBaseAddress(pixelBuffer, 0);
 
@@ -235,67 +276,13 @@ static NSArray<NSNumber *> *_lastCircle = nil;
     cv::Mat frame(height, width, CV_8UC4, base);
 
     //-----------------------------------
-    // Convert to grayscale
+    // Fixed center — user aligns object
+    // to crosshair, no circle detection
     //-----------------------------------
 
-    cv::Mat gray;
-    cv::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY);
-
-    //-----------------------------------
-    // Normalize lighting
-    //-----------------------------------
-
-    cv::Mat norm;
-    cv::normalize(gray, norm, 0, 255, cv::NORM_MINMAX);
-
-    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(6.0);
-    clahe->apply(norm, norm);
-
-    cv::GaussianBlur(norm, norm, cv::Size(5,5), 1.5);
-
-    //-----------------------------------
-    // Circle detection
-    //-----------------------------------
-
-    std::vector<cv::Vec3f> circles;
-
-    // HOUGH_GRADIENT runs Canny internally — feed it grayscale, not edges.
-    // param1 = Canny high threshold (internal), param2 = accumulator threshold
-    cv::HoughCircles(
-        norm,
-        circles,
-        cv::HOUGH_GRADIENT,
-        1.5,            // accumulator resolution
-        norm.rows / 3,  // min distance between centers
-        150,            // Canny high threshold
-        80,             // accumulator threshold (higher = fewer false positives)
-        norm.rows / 6,  // min radius
-        norm.rows / 2   // max radius
-    );
-
-    NSLog(@"[OpenCV] circles detected: %lu", circles.size());
-
-    if(circles.empty())
-    {
-        _lastCircle = nil;
-        CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-        return nil;
-    }
-
-    // Pick the largest circle (most likely the actual object)
-    cv::Vec3f best = circles[0];
-    for(size_t i = 1; i < circles.size(); i++) {
-        if(circles[i][2] > best[2]) best = circles[i];
-    }
-
-    float cx = best[0];
-    float cy = best[1];
-    float r  = best[2];
-
-    // Store for debug overlay
-    _lastCircle = @[@(cx), @(cy), @(r)];
-
-    NSLog(@"[OpenCV] best circle: center=(%.0f, %.0f) radius=%.0f  frame=%dx%d", cx, cy, r, width, height);
+    float cx = width  / 2.0f;
+    float cy = height / 2.0f;
+    float r  = MIN(width, height) * 0.40f;
 
     //-----------------------------------
     // Define ring region (wide band to
@@ -303,9 +290,9 @@ static NSArray<NSNumber *> *_lastCircle = nil;
     //-----------------------------------
 
     float rInner = r * 0.50;
-    float rOuter = r * 1.15;
+    float rOuter = r * 0.95;
 
-    int unwrapHeight = 200;
+    int unwrapHeight = 300;
     int unwrapWidth  = 1200;
 
     //-----------------------------------

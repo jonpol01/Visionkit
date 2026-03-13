@@ -20,8 +20,11 @@ class CameraViewController: UIViewController {
     private var showBottomText = true
     private var showDebugOverlay = true
 
-    /// Circle debug overlay
+    /// Guide overlays
+    private let crosshairLayer = CAShapeLayer()
+    private let ringOverlay = CAShapeLayer()
     private let circleOverlay = CAShapeLayer()
+    private let textHighlightLayer = CAShapeLayer()
 
     /// Multi-frame voting: track how many times each text fragment is seen
     private var textVotes: [String: Int] = [:]
@@ -115,11 +118,30 @@ class CameraViewController: UIViewController {
 
         view.layer.addSublayer(previewLayer)
 
-        // Circle debug overlay
+        // Crosshair overlay
+        crosshairLayer.fillColor = UIColor.clear.cgColor
+        crosshairLayer.strokeColor = UIColor.green.cgColor
+        crosshairLayer.lineWidth = 1
+        view.layer.addSublayer(crosshairLayer)
+
+        // Ring boundary overlay (inner/outer capture ring)
+        ringOverlay.fillColor = UIColor.clear.cgColor
+        ringOverlay.strokeColor = UIColor.cyan.cgColor
+        ringOverlay.lineWidth = 1.5
+        ringOverlay.lineDashPattern = [6, 4]
+        view.layer.addSublayer(ringOverlay)
+
+        // Detected circle overlay (visual only — does not affect unwrap)
         circleOverlay.fillColor = UIColor.clear.cgColor
         circleOverlay.strokeColor = UIColor.green.cgColor
         circleOverlay.lineWidth = 2
         view.layer.addSublayer(circleOverlay)
+
+        // Text highlight overlay (shows what Vision is reading)
+        textHighlightLayer.fillColor = UIColor.yellow.withAlphaComponent(0.15).cgColor
+        textHighlightLayer.strokeColor = UIColor.yellow.cgColor
+        textHighlightLayer.lineWidth = 1.5
+        view.layer.addSublayer(textHighlightLayer)
 
         // Orientation for external HDMI camera
         // External capture cards typically deliver landscape frames.
@@ -187,7 +209,10 @@ class CameraViewController: UIViewController {
         debugButton.setTitle(showDebugOverlay ? "Debug: ON" : "Debug: OFF", for: .normal)
         debugButton.backgroundColor = (showDebugOverlay ? UIColor.systemGreen : UIColor.systemRed).withAlphaComponent(0.8)
         if !showDebugOverlay {
+            crosshairLayer.path = nil
+            ringOverlay.path = nil
             circleOverlay.path = nil
+            textHighlightLayer.path = nil
         }
     }
 }
@@ -235,11 +260,16 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
         }
 
-        // Draw circle overlay (independent toggle)
+        // Run circle detection for visual overlay (separate from unwrap)
+        OpenCVWrapper.detectCircle(pixelBuffer)
+
+        // Draw guide overlay (independent toggle)
         if showDebugOverlay {
-            drawCircleOverlay(bufferWidth: bufferWidth, bufferHeight: bufferHeight)
+            drawGuideOverlay(bufferWidth: bufferWidth, bufferHeight: bufferHeight)
         } else {
             DispatchQueue.main.async { [weak self] in
+                self?.crosshairLayer.path = nil
+                self?.ringOverlay.path = nil
                 self?.circleOverlay.path = nil
             }
         }
@@ -258,12 +288,16 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
             // Collect all top-3 candidates for voting
             var liveStrings = Set<String>()      // best candidate per region (for live label)
             var allCandidates: [(String, Float)] = []  // all candidates with confidence (for voting)
+            var boundingBoxes: [CGRect] = []     // bounding boxes for debug highlight
 
             for observation in observations {
                 let candidates = observation.topCandidates(3)
                 guard let best = candidates.first else { continue }
 
                 let bestText = best.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                if best.confidence > 0.3 && bestText.count > 1 {
+                    boundingBoxes.append(observation.boundingBox)
+                }
                 if best.confidence > 0.5 && bestText.count > 1 {
                     liveStrings.insert(bestText)
                 }
@@ -314,6 +348,32 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
                     self.consensusLabel.text = confirmed.isEmpty
                         ? "Consensus: –"
                         : confirmed.joined(separator: " | ")
+                }
+
+                // Draw text highlight bounding boxes
+                if self.showDebugOverlay {
+                    let viewW = self.view.bounds.width
+                    let viewH = self.view.bounds.height
+                    let highlightPath = UIBezierPath()
+
+                    for bb in boundingBoxes {
+                        // Vision normalized coords (bottom-left, .right orientation) → view coords
+                        // With .right orientation and horizontal mirror on preview:
+                        //   viewX = viewW * bb.minY
+                        //   viewY = viewH * (1 - bb.maxX)
+                        //   width/height swap due to 90° rotation
+                        let rect = CGRect(
+                            x: viewW * bb.minY,
+                            y: viewH * (1 - bb.maxX),
+                            width: viewW * bb.height,
+                            height: viewH * bb.width
+                        )
+                        highlightPath.append(UIBezierPath(roundedRect: rect, cornerRadius: 2))
+                    }
+
+                    self.textHighlightLayer.path = highlightPath.cgPath
+                } else {
+                    self.textHighlightLayer.path = nil
                 }
             }
         }
@@ -376,42 +436,73 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
         try? handler.perform([request])
     }
 
-    // MARK: - Circle debug overlay
+    // MARK: - Guide overlay (crosshair + ring + detected circle)
 
-    private func drawCircleOverlay(bufferWidth: Int, bufferHeight: Int) {
-        guard let circleData = OpenCVWrapper.lastDetectedCircle(),
-              circleData.count == 3 else {
-            DispatchQueue.main.async { [weak self] in
-                self?.circleOverlay.path = nil
-            }
-            return
+    private func drawGuideOverlay(bufferWidth: Int, bufferHeight: Int) {
+        // Detected circle (visual only)
+        var circlePath: CGPath? = nil
+        if let circleData = OpenCVWrapper.lastDetectedCircle(), circleData.count == 3 {
+            let cx = CGFloat(circleData[0].floatValue)
+            let cy = CGFloat(circleData[1].floatValue)
+            let r  = CGFloat(circleData[2].floatValue)
+
+            let viewW = view.bounds.width
+            let viewH = view.bounds.height
+            let scaleX = viewW / CGFloat(bufferWidth)
+            let scaleY = viewH / CGFloat(bufferHeight)
+
+            // Mirror horizontally (matches the -1 scaleX transform on preview)
+            let screenCx = viewW - (cx * scaleX)
+            let screenCy = cy * scaleY
+            let screenR  = r * min(scaleX, scaleY)
+
+            let path = UIBezierPath(
+                arcCenter: CGPoint(x: screenCx, y: screenCy),
+                radius: screenR,
+                startAngle: 0,
+                endAngle: .pi * 2,
+                clockwise: true
+            )
+            circlePath = path.cgPath
         }
 
-        let cx = CGFloat(circleData[0].floatValue)
-        let cy = CGFloat(circleData[1].floatValue)
-        let r  = CGFloat(circleData[2].floatValue)
-
-        // Scale from pixel buffer coords to view coords
-        let viewW = view.bounds.width
-        let viewH = view.bounds.height
-        let scaleX = viewW / CGFloat(bufferWidth)
-        let scaleY = viewH / CGFloat(bufferHeight)
-
-        // Mirror horizontally (matches the -1 scaleX transform on preview)
-        let screenCx = viewW - (cx * scaleX)
-        let screenCy = cy * scaleY
-        let screenR  = r * min(scaleX, scaleY)
-
-        let path = UIBezierPath(
-            arcCenter: CGPoint(x: screenCx, y: screenCy),
-            radius: screenR,
-            startAngle: 0,
-            endAngle: .pi * 2,
-            clockwise: true
-        )
-
         DispatchQueue.main.async { [weak self] in
-            self?.circleOverlay.path = path.cgPath
+            guard let self = self else { return }
+            let viewW = self.view.bounds.width
+            let viewH = self.view.bounds.height
+            let centerX = viewW / 2
+            let centerY = viewH / 2
+            let guideR = min(viewW, viewH) * 0.40
+
+            // Crosshair
+            let crosshair = UIBezierPath()
+            let armLen: CGFloat = 20
+            crosshair.move(to: CGPoint(x: centerX - armLen, y: centerY))
+            crosshair.addLine(to: CGPoint(x: centerX + armLen, y: centerY))
+            crosshair.move(to: CGPoint(x: centerX, y: centerY - armLen))
+            crosshair.addLine(to: CGPoint(x: centerX, y: centerY + armLen))
+            self.crosshairLayer.path = crosshair.cgPath
+
+            // Inner/outer capture ring (matches OpenCV rInner/rOuter)
+            let ringPath = UIBezierPath()
+            ringPath.append(UIBezierPath(
+                arcCenter: CGPoint(x: centerX, y: centerY),
+                radius: guideR * 0.50,
+                startAngle: 0,
+                endAngle: .pi * 2,
+                clockwise: true
+            ))
+            ringPath.append(UIBezierPath(
+                arcCenter: CGPoint(x: centerX, y: centerY),
+                radius: guideR * 0.95,
+                startAngle: 0,
+                endAngle: .pi * 2,
+                clockwise: true
+            ))
+            self.ringOverlay.path = ringPath.cgPath
+
+            // Detected circle (green, visual reference only)
+            self.circleOverlay.path = circlePath
         }
     }
 }
