@@ -25,8 +25,14 @@ class CameraViewController: UIViewController {
     private var showDebugOverlay = true
     private var showVLM = true
 
-    /// FastVLM service
+    /// AI backend selector
+    private enum AIBackend { case fastVLM, qwen }
+    private var aiBackend: AIBackend = .qwen
+
+    /// FastVLM service (image + text)
     private let vlmService = VLMService()
+    /// Qwen LLM service (text-only, lighter)
+    private let llmService = LLMService()
 
     /// Guide overlays
     private let crosshairLayer = CAShapeLayer()
@@ -63,6 +69,7 @@ class CameraViewController: UIViewController {
     private let topTextButton = CameraViewController.makeToggleButton(title: "Vote: ON", color: .systemGreen)
     private let bottomTextButton = CameraViewController.makeToggleButton(title: "OCR: ON", color: .systemGreen)
     private let vlmButton = CameraViewController.makeToggleButton(title: "AI: ON", color: .systemGreen)
+    private let backendButton = CameraViewController.makeToggleButton(title: "Qwen", color: .systemPurple)
     private let debugButton = CameraViewController.makeToggleButton(title: "Debug: ON", color: .systemGreen)
     private let cameraButton = CameraViewController.makeToggleButton(title: "Cam: –", color: .systemBlue)
 
@@ -112,10 +119,16 @@ class CameraViewController: UIViewController {
         super.viewDidLoad()
         setupCamera()
 
-        // Load FastVLM model in background
+        // Load the selected AI backend
         Task { @MainActor in
-            await vlmService.load()
-            vlmLabel.text = "  AI: Ready  "
+            if aiBackend == .qwen {
+                vlmLabel.text = "  AI: Downloading Qwen…  "
+                await llmService.load()
+                vlmLabel.text = "  AI: Qwen Ready  "
+            } else {
+                await vlmService.load()
+                vlmLabel.text = "  AI: FastVLM Ready  "
+            }
         }
     }
 
@@ -234,7 +247,7 @@ class CameraViewController: UIViewController {
         view.addSubview(consensusLabel)
         view.addSubview(vlmLabel)
 
-        let buttonStack = UIStackView(arrangedSubviews: [cameraButton, vlmButton, topTextButton, bottomTextButton, debugButton])
+        let buttonStack = UIStackView(arrangedSubviews: [cameraButton, vlmButton, backendButton, topTextButton, bottomTextButton, debugButton])
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
         buttonStack.axis = .vertical
         buttonStack.alignment = .trailing
@@ -243,6 +256,7 @@ class CameraViewController: UIViewController {
 
         cameraButton.addTarget(self, action: #selector(cycleCamera), for: .touchUpInside)
         vlmButton.addTarget(self, action: #selector(toggleVLM), for: .touchUpInside)
+        backendButton.addTarget(self, action: #selector(switchBackend), for: .touchUpInside)
         topTextButton.addTarget(self, action: #selector(toggleTopText), for: .touchUpInside)
         bottomTextButton.addTarget(self, action: #selector(toggleBottomText), for: .touchUpInside)
         debugButton.addTarget(self, action: #selector(toggleDebug), for: .touchUpInside)
@@ -276,6 +290,23 @@ class CameraViewController: UIViewController {
         vlmButton.backgroundColor = (showVLM ? UIColor.systemGreen : UIColor.systemRed).withAlphaComponent(0.8)
         if !showVLM {
             vlmLabel.text = "  AI: Off  "
+        }
+    }
+
+    @objc private func switchBackend() {
+        aiBackend = (aiBackend == .qwen) ? .fastVLM : .qwen
+        let name = aiBackend == .qwen ? "Qwen" : "FastVLM"
+        backendButton.setTitle("\(name)", for: .normal)
+        vlmLabel.text = "  AI: Loading \(name)…  "
+
+        Task { @MainActor in
+            if aiBackend == .qwen {
+                await llmService.load()
+                vlmLabel.text = "  AI: Qwen Ready  "
+            } else {
+                await vlmService.load()
+                vlmLabel.text = "  AI: FastVLM Ready  "
+            }
         }
     }
 
@@ -333,25 +364,43 @@ class CameraViewController: UIViewController {
         print("Switched to camera:", newCamera.localizedName)
     }
 
-    /// Ask the VLM to correct OCR fragments using the image + OCR hints.
-    private func sendToVLM(pixelBuffer: CVPixelBuffer, ocrCandidates: [String]) {
+    /// Ask the AI backend to correct OCR fragments.
+    private func sendToAI(pixelBuffer: CVPixelBuffer, ocrCandidates: [String]) {
         let joined = ocrCandidates.joined(separator: ", ")
-        let prompt = """
-        OCR detected these text fragments on this engraved metal part: \(joined)
-        Correct any errors and output ONLY the final text. No explanations.
-        """
 
-        NSLog("[VLM input] %@", joined)
+        NSLog("[AI input] %@", joined)
 
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let result = await self.vlmService.recognize(
-                pixelBuffer: pixelBuffer,
-                prompt: prompt
-            )
-            let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
-            NSLog("[VLM output] %@", trimmed)
-            self.vlmLabel.text = trimmed.isEmpty ? "  AI: (no text)  " : "  \(trimmed)  "
+        switch aiBackend {
+        case .fastVLM:
+            guard vlmService.isReady else { return }
+            let prompt = """
+            OCR detected these text fragments on this engraved metal part: \(joined)
+            Correct any errors and output ONLY the final text. No explanations.
+            """
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let result = await self.vlmService.recognize(
+                    pixelBuffer: pixelBuffer,
+                    prompt: prompt
+                )
+                let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+                NSLog("[AI output] %@", trimmed)
+                self.vlmLabel.text = trimmed.isEmpty ? "  AI: (no text)  " : "  \(trimmed)  "
+            }
+
+        case .qwen:
+            guard llmService.isReady else { return }
+            let prompt = """
+            OCR detected these text fragments on an engraved metal part: \(joined)
+            Correct any errors and output ONLY the final text. No explanations.
+            """
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let result = await self.llmService.recognizeText(prompt: prompt)
+                let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+                NSLog("[AI output] %@", trimmed)
+                self.vlmLabel.text = trimmed.isEmpty ? "  AI: (no text)  " : "  \(trimmed)  "
+            }
         }
     }
 
@@ -498,14 +547,15 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
                         ? "Consensus: –"
                         : confirmed.joined(separator: " | ")
 
-                    // Feed high-confidence candidates (10+ votes) to VLM for correction
-                    if self.showVLM && self.vlmService.isReady {
+                    // Feed high-confidence candidates (10+ votes) to AI for correction
+                    let aiReady = self.aiBackend == .qwen ? self.llmService.isReady : self.vlmService.isReady
+                    if self.showVLM && aiReady {
                         let highConfidence = self.textVotes
                             .filter { $0.value >= self.minVotesForVLM }
                             .sorted { $0.value > $1.value }
                             .map { $0.key }
                         if !highConfidence.isEmpty {
-                            self.sendToVLM(pixelBuffer: rawBuffer, ocrCandidates: highConfidence)
+                            self.sendToAI(pixelBuffer: rawBuffer, ocrCandidates: highConfidence)
                         }
                     }
                 }
