@@ -487,14 +487,14 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
             let ringPath = UIBezierPath()
             ringPath.append(UIBezierPath(
                 arcCenter: CGPoint(x: centerX, y: centerY),
-                radius: guideR * 0.50,
+                radius: guideR * 0.45,
                 startAngle: 0,
                 endAngle: .pi * 2,
                 clockwise: true
             ))
             ringPath.append(UIBezierPath(
                 arcCenter: CGPoint(x: centerX, y: centerY),
-                radius: guideR * 0.95,
+                radius: guideR * 1.10,
                 startAngle: 0,
                 endAngle: .pi * 2,
                 clockwise: true

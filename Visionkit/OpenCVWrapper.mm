@@ -289,8 +289,8 @@ static NSArray<NSNumber *> *_lastCircle = nil;
     // capture text at various positions)
     //-----------------------------------
 
-    float rInner = r * 0.50;
-    float rOuter = r * 0.95;
+    float rInner = r * 0.45;
+    float rOuter = r * 1.10;
 
     int unwrapHeight = 300;
     int unwrapWidth  = 1200;
