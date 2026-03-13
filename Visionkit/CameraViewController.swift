@@ -392,11 +392,15 @@ class CameraViewController: UIViewController {
             guard llmService.isReady else { return }
             let prompt = """
             OCR detected these text fragments on an engraved metal part: \(joined)
-            Correct any errors and output ONLY the final text. No explanations.
+            Correct any errors and output ONLY the final text. No explanations. /no_think
             """
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                let result = await self.llmService.recognizeText(prompt: prompt)
+                var result = await self.llmService.recognizeText(prompt: prompt)
+                // Strip any <think>...</think> blocks Qwen may still emit
+                if let range = result.range(of: "<think>[\\s\\S]*?</think>", options: .regularExpression) {
+                    result = result.replacingCharacters(in: range, with: "")
+                }
                 let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
                 NSLog("[AI output] %@", trimmed)
                 self.vlmLabel.text = trimmed.isEmpty ? "  AI: (no text)  " : "  \(trimmed)  "
