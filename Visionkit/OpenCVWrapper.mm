@@ -292,8 +292,8 @@ static NSArray<NSNumber *> *_lastCircle = nil;
     float rInner = r * 0.45;
     float rOuter = r * 1.10;
 
-    int unwrapHeight = 300;
-    int unwrapWidth  = 1200;
+    int unwrapHeight = 400;
+    int unwrapWidth  = 2400;
 
     //-----------------------------------
     // Build remap grids
@@ -336,34 +336,45 @@ static NSArray<NSNumber *> *_lastCircle = nil;
     );
 
     //-----------------------------------
+    // Flip horizontally (raw buffer is
+    // mirrored vs preview) so text reads
+    // correctly for Vision OCR
+    //-----------------------------------
+
+    cv::flip(unwrapped, unwrapped, 1);
+
+    //-----------------------------------
     // Convert to grayscale + clean + enhance
     //-----------------------------------
 
     cv::Mat grayBand;
     cv::cvtColor(unwrapped, grayBand, cv::COLOR_BGRA2GRAY);
 
-    // Bilateral filter: smooth noise/dirt while preserving text edges
-    cv::Mat filtered;
-    cv::bilateralFilter(grayBand, filtered, 9, 75, 75);
+    // Mild blur to reduce noise without destroying text edges
+    cv::GaussianBlur(grayBand, grayBand, cv::Size(3, 3), 0.5);
 
-    // Morphological opening: remove small bright/dark spots (dirt)
-    cv::Mat kernel = cv::getStructuringElement(
-        cv::MORPH_ELLIPSE, cv::Size(3, 3)
+    // CLAHE — enhance local contrast (makes engravings stand out)
+    cv::Ptr<cv::CLAHE> clahe2 = cv::createCLAHE(3.0, cv::Size(8, 8));
+    clahe2->apply(grayBand, grayBand);
+
+    // Adaptive threshold — binarize based on local contrast
+    // Works well for engraved text (local dark marks on lighter metal)
+    cv::Mat binary;
+    cv::adaptiveThreshold(
+        grayBand, binary, 255,
+        cv::ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv::THRESH_BINARY,
+        31,   // block size
+        8     // C constant
     );
-    cv::morphologyEx(filtered, filtered, cv::MORPH_OPEN, kernel);
-    cv::morphologyEx(filtered, filtered, cv::MORPH_CLOSE, kernel);
 
-    // CLAHE for better contrast
-    cv::Ptr<cv::CLAHE> clahe2 = cv::createCLAHE(4.0);
-    clahe2->apply(filtered, filtered);
+    // Small morphological close to fill gaps in thin text strokes
+    cv::Mat kernel = cv::getStructuringElement(
+        cv::MORPH_RECT, cv::Size(2, 2)
+    );
+    cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
 
-    // Sharpen to make text edges crisper
-    cv::Mat sharpKernel = (cv::Mat_<float>(3,3) <<
-         0, -1,  0,
-        -1,  5, -1,
-         0, -1,  0);
-    cv::Mat sharpened;
-    cv::filter2D(filtered, sharpened, -1, sharpKernel);
+    cv::Mat &sharpened = binary;
 
     //-----------------------------------
     // Output CVPixelBuffer

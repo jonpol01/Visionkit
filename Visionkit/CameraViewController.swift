@@ -15,6 +15,10 @@ class CameraViewController: UIViewController {
     private var previewLayer: AVCaptureVideoPreviewLayer!
     private var lastProcessTime = Date()
 
+    /// Available cameras and current index
+    private var availableCameras: [AVCaptureDevice] = []
+    private var currentCameraIndex = 0
+
     /// Toggles
     private var showTopText = true
     private var showBottomText = true
@@ -26,6 +30,9 @@ class CameraViewController: UIViewController {
     private let circleOverlay = CAShapeLayer()
     private let textHighlightLayer = CAShapeLayer()
 
+    /// Cached view size for background-thread ROI calculation
+    private var cachedViewSize: CGSize = .zero
+
     /// Multi-frame voting: track how many times each text fragment is seen
     private var textVotes: [String: Int] = [:]
     private var lastVoteReset = Date()
@@ -33,9 +40,10 @@ class CameraViewController: UIViewController {
     private let minVotesToShow = 3  // must be seen at least N times
 
     // Buttons
-    private let topTextButton = CameraViewController.makeToggleButton(title: "Top: ON", color: .systemGreen)
-    private let bottomTextButton = CameraViewController.makeToggleButton(title: "Bottom: ON", color: .systemGreen)
+    private let topTextButton = CameraViewController.makeToggleButton(title: "VLM: ON", color: .systemGreen)
+    private let bottomTextButton = CameraViewController.makeToggleButton(title: "OCR: ON", color: .systemGreen)
     private let debugButton = CameraViewController.makeToggleButton(title: "Debug: ON", color: .systemGreen)
+    private let cameraButton = CameraViewController.makeToggleButton(title: "Cam: –", color: .systemBlue)
 
     private static func makeToggleButton(title: String, color: UIColor) -> UIButton {
         let btn = UIButton(type: .system)
@@ -84,24 +92,60 @@ class CameraViewController: UIViewController {
         setupCamera()
     }
 
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        cachedViewSize = view.bounds.size
+        previewLayer?.frame = view.bounds
+    }
+
+    /// Compute a centered ROI matching the guide circle, in normalized image coordinates.
+    private func guideRegionOfInterest(bufferWidth: Int, bufferHeight: Int) -> CGRect {
+        let viewSize = cachedViewSize
+        guard viewSize.width > 0, viewSize.height > 0 else {
+            return CGRect(x: 0, y: 0, width: 1, height: 1)
+        }
+
+        let bufW = CGFloat(bufferWidth)
+        let bufH = CGFloat(bufferHeight)
+
+        // Match the aspectFill scale used by the preview layer
+        let scale = max(viewSize.width / bufW, viewSize.height / bufH)
+
+        // Guide circle radius (slightly wider than visual guide for OCR margin)
+        let guideR = min(viewSize.width, viewSize.height) * 0.50
+        let bufGuideR = guideR / scale
+
+        // Centered square ROI that inscribes the guide circle
+        let roiW = min((2 * bufGuideR) / bufW, 1.0)
+        let roiH = min((2 * bufGuideR) / bufH, 1.0)
+        let roiX = max((1.0 - roiW) / 2.0, 0.0)
+        let roiY = max((1.0 - roiH) / 2.0, 0.0)
+
+        return CGRect(x: roiX, y: roiY, width: roiW, height: roiH)
+    }
+
     private func setupCamera() {
         captureSession.sessionPreset = .hd4K3840x2160
-        
-        for device in AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.external, .builtInWideAngleCamera],
+
+        // Discover all available cameras
+        availableCameras = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.external, .builtInWideAngleCamera, .builtInUltraWideCamera, .builtInTelephotoCamera],
             mediaType: .video,
             position: .unspecified
-        ).devices {
+        ).devices
+
+        for device in availableCameras {
             print("Found camera:", device.localizedName)
         }
-  
-        // Use HDMI camera
-        guard let camera = AVCaptureDevice.default(.external, for: .video, position: .unspecified) else {
-            print("HDMI camera not found")
+
+        guard let camera = availableCameras.first else {
+            print("No camera found")
             return
         }
-  
+
+        currentCameraIndex = 0
         captureSession.addInput(try! AVCaptureDeviceInput(device: camera))
+        cameraButton.setTitle("Cam: \(shortName(camera))", for: .normal)
 
         let output = AVCaptureVideoDataOutput()
         output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "videoQueue"))
@@ -113,8 +157,12 @@ class CameraViewController: UIViewController {
                 
         previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
         previewLayer.videoGravity = .resizeAspectFill
+//        previewLayer.videoGravity = .resizeAspect
         previewLayer.frame = view.bounds
-        previewLayer.setAffineTransform(CGAffineTransform(scaleX: -1, y: 1))
+        // Skip mirror when running as "Designed for iPad" on Mac
+        if !ProcessInfo.processInfo.isiOSAppOnMac {
+            previewLayer.setAffineTransform(CGAffineTransform(scaleX: -1, y: 1))
+        }
 
         view.layer.addSublayer(previewLayer)
 
@@ -158,13 +206,14 @@ class CameraViewController: UIViewController {
         view.addSubview(overlayLabel)
         view.addSubview(consensusLabel)
 
-        let buttonStack = UIStackView(arrangedSubviews: [topTextButton, bottomTextButton, debugButton])
+        let buttonStack = UIStackView(arrangedSubviews: [cameraButton, topTextButton, bottomTextButton, debugButton])
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
         buttonStack.axis = .vertical
         buttonStack.alignment = .trailing
         buttonStack.spacing = 8
         view.addSubview(buttonStack)
 
+        cameraButton.addTarget(self, action: #selector(cycleCamera), for: .touchUpInside)
         topTextButton.addTarget(self, action: #selector(toggleTopText), for: .touchUpInside)
         bottomTextButton.addTarget(self, action: #selector(toggleBottomText), for: .touchUpInside)
         debugButton.addTarget(self, action: #selector(toggleDebug), for: .touchUpInside)
@@ -189,7 +238,7 @@ class CameraViewController: UIViewController {
     @objc private func toggleTopText() {
         showTopText.toggle()
         consensusLabel.isHidden = !showTopText
-        topTextButton.setTitle(showTopText ? "Top: ON" : "Top: OFF", for: .normal)
+        topTextButton.setTitle(showTopText ? "VLM: ON" : "VLM: OFF", for: .normal)
         topTextButton.backgroundColor = (showTopText ? UIColor.systemGreen : UIColor.systemRed).withAlphaComponent(0.8)
         if !showTopText {
             textVotes.removeAll()
@@ -200,7 +249,7 @@ class CameraViewController: UIViewController {
     @objc private func toggleBottomText() {
         showBottomText.toggle()
         overlayLabel.isHidden = !showBottomText
-        bottomTextButton.setTitle(showBottomText ? "Bottom: ON" : "Bottom: OFF", for: .normal)
+        bottomTextButton.setTitle(showBottomText ? "OCR: ON" : "OCR: OFF", for: .normal)
         bottomTextButton.backgroundColor = (showBottomText ? UIColor.systemGreen : UIColor.systemRed).withAlphaComponent(0.8)
     }
 
@@ -214,6 +263,38 @@ class CameraViewController: UIViewController {
             circleOverlay.path = nil
             textHighlightLayer.path = nil
         }
+    }
+
+    @objc private func cycleCamera() {
+        guard availableCameras.count > 1 else { return }
+
+        currentCameraIndex = (currentCameraIndex + 1) % availableCameras.count
+        let newCamera = availableCameras[currentCameraIndex]
+
+        captureSession.beginConfiguration()
+
+        // Remove existing camera input
+        for input in captureSession.inputs {
+            captureSession.removeInput(input)
+        }
+
+        // Add new camera
+        if let newInput = try? AVCaptureDeviceInput(device: newCamera) {
+            captureSession.addInput(newInput)
+        }
+
+        captureSession.commitConfiguration()
+
+        cameraButton.setTitle("Cam: \(shortName(newCamera))", for: .normal)
+        print("Switched to camera:", newCamera.localizedName)
+    }
+
+    private func shortName(_ device: AVCaptureDevice) -> String {
+        let name = device.localizedName
+        if name.count > 12 {
+            return String(name.prefix(12)) + "…"
+        }
+        return name
     }
 }
 
@@ -383,6 +464,11 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
         request.recognitionLanguages = ["en_US"]
         request.minimumTextHeight = 0.003
 
+        // Only process text within the guide circle region
+        let bufW = CVPixelBufferGetWidth(pixelBuffer)
+        let bufH = CVPixelBufferGetHeight(pixelBuffer)
+        request.regionOfInterest = guideRegionOfInterest(bufferWidth: bufW, bufferHeight: bufH)
+
         let handler = VNImageRequestHandler(
             cvPixelBuffer: pixelBuffer,
             orientation: orientation,
@@ -439,37 +525,38 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
     // MARK: - Guide overlay (crosshair + ring + detected circle)
 
     private func drawGuideOverlay(bufferWidth: Int, bufferHeight: Int) {
-        // Detected circle (visual only)
-        var circlePath: CGPath? = nil
-        if let circleData = OpenCVWrapper.lastDetectedCircle(), circleData.count == 3 {
-            let cx = CGFloat(circleData[0].floatValue)
-            let cy = CGFloat(circleData[1].floatValue)
-            let r  = CGFloat(circleData[2].floatValue)
-
-            let viewW = view.bounds.width
-            let viewH = view.bounds.height
-            let scaleX = viewW / CGFloat(bufferWidth)
-            let scaleY = viewH / CGFloat(bufferHeight)
-
-            // Mirror horizontally (matches the -1 scaleX transform on preview)
-            let screenCx = viewW - (cx * scaleX)
-            let screenCy = cy * scaleY
-            let screenR  = r * min(scaleX, scaleY)
-
-            let path = UIBezierPath(
-                arcCenter: CGPoint(x: screenCx, y: screenCy),
-                radius: screenR,
-                startAngle: 0,
-                endAngle: .pi * 2,
-                clockwise: true
-            )
-            circlePath = path.cgPath
-        }
+        // Read circle data on background thread (safe), but compute screen coords on main
+        let circleData = OpenCVWrapper.lastDetectedCircle()
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             let viewW = self.view.bounds.width
             let viewH = self.view.bounds.height
+
+            // Detected circle (visual only)
+            var circlePath: CGPath? = nil
+            if let circleData = circleData, circleData.count == 3 {
+                let cx = CGFloat(circleData[0].floatValue)
+                let cy = CGFloat(circleData[1].floatValue)
+                let r  = CGFloat(circleData[2].floatValue)
+
+                let scaleX = viewW / CGFloat(bufferWidth)
+                let scaleY = viewH / CGFloat(bufferHeight)
+
+                // Mirror horizontally (matches the -1 scaleX transform on preview)
+                let screenCx = viewW - (cx * scaleX)
+                let screenCy = cy * scaleY
+                let screenR  = r * min(scaleX, scaleY)
+
+                let path = UIBezierPath(
+                    arcCenter: CGPoint(x: screenCx, y: screenCy),
+                    radius: screenR,
+                    startAngle: 0,
+                    endAngle: .pi * 2,
+                    clockwise: true
+                )
+                circlePath = path.cgPath
+            }
             let centerX = viewW / 2
             let centerY = viewH / 2
             let guideR = min(viewW, viewH) * 0.40
